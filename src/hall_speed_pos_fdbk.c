@@ -8,7 +8,7 @@
   ******************************************************************************
   * @attention
   *
-  * <h2><center>&copy; Copyright (c) 2022 STMicroelectronics.
+  * <h2><center>&copy; Copyright (c) 2025 STMicroelectronics.
   * All rights reserved.</center></h2>
   *
   * This software component is licensed by ST under Ultimate Liberty license
@@ -24,7 +24,6 @@
 #include "speed_pos_fdbk.h"
 #include "hall_speed_pos_fdbk.h"
 #include "mc_type.h"
-#include "vehicle_directionctrl.h"
 
 /** @addtogroup MCSDK
   * @{
@@ -43,12 +42,10 @@
   *
   * @brief Hall Sensor based Speed & Position Feedback implementation
   *
-  * This component is used in applications controlling a motor equipped with Hall effect sensors.
+  * This component requires a motor equipped with Hall effect sensors.
+  * It uses the sensors to provide a measure of the speed and the position of the rotor of the motor.
   *
-  * This component uses the output of two Hall effects sensors to provide a measure of the speed
-  * and the position of the rotor of the motor.
-  *
-  * @todo Document the Hall Speed & Position Feedback "module".
+  * More detail in [Hall sensor Feedback processing](rotor_speed_pos_feedback_hall.md).
   *
   * @{
   */
@@ -75,6 +72,9 @@
 #define NEGATIVE          (int8_t)-1
 #define POSITIVE          (int8_t)1
 
+/* Number of HALL TIM process for coming back from unriability */
+#define RELIABILITY_NB    (int16_t)7U
+
 /* With digit-per-PWM unit (here 2*PI rad = 0xFFFF): */
 #define HALL_MAX_PSEUDO_SPEED       ((int16_t)0x7FFF)
 
@@ -83,13 +83,11 @@
 
 static void HALL_Init_Electrical_Angle(HALL_Handle_t *pHandle);
 
-
 /**
   * @brief  It initializes the hardware peripherals (TIMx, GPIO and NVIC)
             required for the speed position sensor management using HALL
             sensors.
   * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component
-  * @retval none
   */
 __weak void HALL_Init(HALL_Handle_t *pHandle)
 {
@@ -198,7 +196,6 @@ __weak void HALL_Init(HALL_Handle_t *pHandle)
   *         This function must be called before starting the motor to initialize
   *         the speed measurement process.
   * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component*
-  * @retval none
   */
 __weak void HALL_Clear(HALL_Handle_t *pHandle)
 {
@@ -277,6 +274,7 @@ __weak int16_t HALL_CalcElAngle(HALL_Handle_t *pHandle)
   else
   {
 #endif
+
     if (pHandle->_Super.hElSpeedDpp != HALL_MAX_PSEUDO_SPEED)
     {
       pHandle->IncrementElAngle += pHandle->_Super.hElSpeedDpp + pHandle->CompSpeed;
@@ -302,6 +300,7 @@ __weak int16_t HALL_CalcElAngle(HALL_Handle_t *pHandle)
     {
       pHandle->_Super.hElAngle += pHandle->PrevRotorFreq;
     }
+
     retValue = pHandle->_Super.hElAngle;
 #ifdef NULL_PTR_CHECK_HALL_SPD_POS_FDB
   }
@@ -329,10 +328,13 @@ __weak int16_t HALL_CalcElAngle(HALL_Handle_t *pHandle)
   * @retval true = sensor information is reliable
   *         false = sensor information is not reliable
   */
+bool hallmecvariableloop=false;
+bool deltaangleloop=false;
+
 __weak bool HALL_CalcAvrgMecSpeedUnit(HALL_Handle_t *pHandle, int16_t *hMecSpeedUnit)
 {
 
-  bool bReliability;
+	bool bReliability;
 #ifdef NULL_PTR_CHECK_HALL_SPD_POS_FDB
   if ((NULL == pHandle) || (NULL == hMecSpeedUnit))
   {
@@ -342,6 +344,13 @@ __weak bool HALL_CalcAvrgMecSpeedUnit(HALL_Handle_t *pHandle, int16_t *hMecSpeed
   {
 #endif
     TIM_TypeDef *TIMx = pHandle->TIMx;
+
+    if(hallmecvariableloop == true){
+    	hallmecvariableloop = false;
+    }
+    else if(hallmecvariableloop == false) {
+    	hallmecvariableloop = true;
+    }
 
     if (pHandle->SensorIsReliable)
     {
@@ -373,6 +382,12 @@ __weak bool HALL_CalcAvrgMecSpeedUnit(HALL_Handle_t *pHandle, int16_t *hMecSpeed
             }
             else
             {
+              if(deltaangleloop == true){
+            	  deltaangleloop = false;
+              }
+              else if(deltaangleloop == false) {
+            	  deltaangleloop = true;
+              }
               pHandle->DeltaAngle = pHandle->MeasuredElAngle - pHandle->_Super.hElAngle;
               pHandle->CompSpeed = (int16_t)((int32_t)(pHandle->DeltaAngle) / (int32_t)(pHandle->PWMNbrPSamplingFreq));
             }
@@ -396,6 +411,7 @@ __weak bool HALL_CalcAvrgMecSpeedUnit(HALL_Handle_t *pHandle, int16_t *hMecSpeed
       /* If speed is not reliable the El and Mec speed is set to 0 */
       pHandle->_Super.hElSpeedDpp = 0;
       *hMecSpeedUnit = 0;
+      pHandle->CompSpeed = 0;
     }
 
     pHandle->_Super.hAvrMecSpeedUnit = *hMecSpeedUnit;
@@ -417,7 +433,6 @@ __attribute__((section(".ccmram")))
   * @brief  Example of private method of the class HALL to implement an MC IRQ function
   *         to be called when TIMx capture event occurs
   * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component
-  * @retval none
   */
 __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
 {
@@ -429,25 +444,24 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
   uint8_t bPrevHallState;
   int8_t PrevDirection;
 
+  /* A capture event generated this interrupt */
+  bPrevHallState = pHandle->HallState;
+  PrevDirection = pHandle->Direction;
+
+  if (DEGREES_120 == pHandle->SensorPlacement)
+  {
+    pHandle->HallState  = (uint8_t)((LL_GPIO_IsInputPinSet(pHandle->H3Port, pHandle->H3Pin) << 2U)
+                                    | (LL_GPIO_IsInputPinSet(pHandle->H2Port, pHandle->H2Pin) << 1U)
+                                    | LL_GPIO_IsInputPinSet(pHandle->H1Port, pHandle->H1Pin));
+  }
+  else
+  {
+    pHandle->HallState  = (uint8_t)(((LL_GPIO_IsInputPinSet(pHandle->H2Port, pHandle->H2Pin) ^ 1U) << 2U)
+                                    | (LL_GPIO_IsInputPinSet(pHandle->H3Port, pHandle->H3Pin) << 1U)
+                                    | LL_GPIO_IsInputPinSet(pHandle->H1Port, pHandle->H1Pin));
+  }
   if (pHandle->SensorIsReliable)
   {
-    /* A capture event generated this interrupt */
-    bPrevHallState = pHandle->HallState;
-    PrevDirection = pHandle->Direction;
-
-    if (DEGREES_120 == pHandle->SensorPlacement)
-    {
-      pHandle->HallState  = (uint8_t)((LL_GPIO_IsInputPinSet(pHandle->H3Port, pHandle->H3Pin) << 2U)
-                                      | (LL_GPIO_IsInputPinSet(pHandle->H2Port, pHandle->H2Pin) << 1U)
-                                      | LL_GPIO_IsInputPinSet(pHandle->H1Port, pHandle->H1Pin));
-    }
-    else
-    {
-      pHandle->HallState  = (uint8_t)(((LL_GPIO_IsInputPinSet(pHandle->H2Port, pHandle->H2Pin) ^ 1U) << 2U)
-                                      | (LL_GPIO_IsInputPinSet(pHandle->H3Port, pHandle->H3Pin) << 1U)
-                                      | LL_GPIO_IsInputPinSet(pHandle->H1Port, pHandle->H1Pin));
-    }
-
     switch (pHandle->HallState)
     {
       case STATE_5:
@@ -456,11 +470,13 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         {
           pHandle->Direction = POSITIVE;
           pHandle->MeasuredElAngle = pHandle->PhaseShift;
+
         }
         else if (STATE_1 == bPrevHallState)
         {
           pHandle->Direction = NEGATIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift + S16_60_PHASE_SHIFT);
+
 		}
         else
         {
@@ -475,11 +491,13 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         {
           pHandle->Direction = POSITIVE;
           pHandle->MeasuredElAngle = pHandle->PhaseShift + S16_60_PHASE_SHIFT;
+
 		}
         else if (STATE_3 == bPrevHallState)
         {
           pHandle->Direction = NEGATIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift + S16_120_PHASE_SHIFT);
+
 		}
         else
         {
@@ -494,11 +512,13 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         {
           pHandle->Direction = POSITIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift + S16_120_PHASE_SHIFT);
+
 		}
         else if (STATE_2 == bPrevHallState)
         {
           pHandle->Direction = NEGATIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift + S16_120_PHASE_SHIFT + S16_60_PHASE_SHIFT);
+
         }
         else
         {
@@ -519,6 +539,7 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         {
           pHandle->Direction = NEGATIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift - S16_120_PHASE_SHIFT);
+
 		}
         else
         {
@@ -554,11 +575,13 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         {
           pHandle->Direction = POSITIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift - S16_60_PHASE_SHIFT);
+
 		}
         else if (STATE_5 == bPrevHallState)
         {
           pHandle->Direction = NEGATIVE;
           pHandle->MeasuredElAngle = (int16_t)(pHandle->PhaseShift);
+
         }
         else
         {
@@ -574,6 +597,7 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
         break;
       }
     }
+
     /* We need to check that the direction has not changed.
        If it is the case, the sign of the current speed can be the opposite of the
        average speed, and the average time can be close to 0 which lead to a
@@ -738,6 +762,26 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
       pHandle->OVFCounter = 0U;
     }
   }
+  else
+  {
+    /* manage the come back to reliability */
+    if ((STATE_0 == pHandle->HallState) || (STATE_7 == pHandle->HallState))
+    {
+      pHandle->SensorReliabilityCounter = 0U;
+    }
+    else
+    {
+      pHandle->SensorReliabilityCounter++;
+    }
+    if (RELIABILITY_NB == pHandle->SensorReliabilityCounter)
+    {
+      pHandle->SensorIsReliable = true;
+      pHandle->_Super.bSpeedErrorNumber = 0U;
+    }
+    else{
+      /* Nothing to do */
+    }
+  }
   return (MC_NULL);
 }
 
@@ -748,12 +792,11 @@ __weak void *HALL_TIMx_CC_IRQHandler(void *pHandleVoid)
 __attribute__((section(".ccmram")))
 #endif
 #endif
-	/**
-	  * @brief  Example of private method of the class HALL to implement an MC IRQ function
-	  *         to be called when TIMx update event occurs
-	  * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component
-	  * @retval none
-	  */
+/**
+  * @brief  Example of private method of the class HALL to implement an MC IRQ function
+  *         to be called when TIMx update event occurs
+  * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component
+  */
 __weak void *HALL_TIMx_UP_IRQHandler(void *pHandleVoid)
 {
   HALL_Handle_t *pHandle = (HALL_Handle_t *)pHandleVoid; //cstat !MISRAC2012-Rule-11.5
@@ -802,7 +845,6 @@ __weak void *HALL_TIMx_UP_IRQHandler(void *pHandleVoid)
   *         way the position of the rotor (+/- 30ï¿½). Electrical angle is then
   *         initialized.
   * @param  pHandle: handler of the current instance of the hall_speed_pos_fdbk component
-  * @retval none
   */
 static void HALL_Init_Electrical_Angle(HALL_Handle_t *pHandle)
 {
@@ -827,8 +869,7 @@ static void HALL_Init_Electrical_Angle(HALL_Handle_t *pHandle)
                                       | LL_GPIO_IsInputPinSet(pHandle->H1Port, pHandle->H1Pin));
     }
 
-
-   switch (pHandle->HallState)
+    switch (pHandle->HallState)
     {
       case STATE_5:
       {
@@ -893,7 +934,6 @@ static void HALL_Init_Electrical_Angle(HALL_Handle_t *pHandle)
   *         version of Hall sensor class.
   * @param  pHandle pointer on related component instance
   * @param  hMecAngle istantaneous measure of rotor mechanical angle
-  * @retval none
   */
 __weak void HALL_SetMecAngle(HALL_Handle_t *pHandle, int16_t hMecAngle)
 {
@@ -907,6 +947,9 @@ __weak void HALL_SetMecAngle(HALL_Handle_t *pHandle, int16_t hMecAngle)
   * @}
   */
 
+/**
+  * @}
+  */
 /** @} */
 
-/************************ (C) COPYRIGHT 2022 STMicroelectronics *****END OF FILE****/
+/************************ (C) COPYRIGHT 2025 STMicroelectronics *****END OF FILE****/
